@@ -1,0 +1,194 @@
+% =========================================================================
+% PTISMC Core Modules for HVAC Temperature & Humidity Control
+% "Predefined-time sliding mode control for HVAC systems
+%  with adaptive disturbance rejection"
+% =========================================================================
+% This file contains the three core algorithmic modules:
+%   Module 1: FNN Identifier  -- online identification of coupling function f
+%   Module 2: ASMDO           -- adaptive sliding mode disturbance observer
+%   Module 3: PTISMC          -- predefined-time integral sliding mode controller
+%
+% All modules are self-contained and can be called per control cycle.
+% =========================================================================
+
+%% ===== Module 1: Fuzzy Neural Network (FNN) Identifier =====
+% Online identifies the nonlinear coupling function f(x1, x2, u1)
+% using a Gaussian RBF network with gradient-descent adaptation.
+
+function [f_hat, c, sigma, w, z_fnn] = fnn_identifier(psi, f_true, c, sigma, w, params)
+% Inputs:
+%   psi     - [x1; x2; u1]  (3x1)  FNN input vector
+%   f_true  - scalar, true coupling function (for supervised learning)
+%   c       - (3 x K) neuron centers
+%   sigma   - (1 x K) neuron widths
+%   w       - (1 x K) neuron output weights
+%   params  - struct with fields: K, lr_W, lr_c, lr_s
+% Outputs:
+%   f_hat   - scalar, FNN output (estimated coupling function)
+%   c, sigma, w - updated FNN parameters
+%   z_fnn   - identification error
+
+K    = params.K;
+lr_W = params.lr_W;
+lr_c = params.lr_c;
+lr_s = params.lr_s;
+
+% Compute Gaussian activations
+S = zeros(1, K);
+for k = 1:K
+    diff_vec = psi - c(:,k);
+    S(k) = exp( -(diff_vec' * diff_vec) / (2 * sigma(k)^2 + 1e-12) );
+end
+sum_S = sum(S) + 1e-12;
+
+% FNN output (center-of-gravity defuzzification)
+f_hat = sum(w .* S) / sum_S;
+
+% Identification error
+z_fnn = f_true - f_hat;
+
+% Gradient descent parameter update
+w = w + lr_W * z_fnn .* S ./ sum_S;
+for k = 1:K
+    diff_vec = psi - c(:,k);
+
+    grad_c = lr_c * z_fnn * w(k) * S(k) * diff_vec ...
+           / (sigma(k)^2 * sum_S + 1e-12);
+    c(:,k) = c(:,k) + grad_c;
+
+    grad_s = lr_s * z_fnn * w(k) * S(k) * (diff_vec' * diff_vec) ...
+           / (sigma(k)^3 * sum_S + 1e-12);
+    sigma(k) = max(sigma(k) + grad_s, 0.2);
+end
+end
+
+%% ===== Module 2: Adaptive Sliding Mode Disturbance Observer (ASMDO) =====
+% Estimates the unknown external disturbance d1 without requiring
+% prior knowledge of the upper bound of its derivative.
+
+function [d_hat, v, beta0_hat] = asmdo(x1, x1_prev, g1, u1, d_hat_prev, v_prev, beta0_hat, Ts, params)
+% Inputs:
+%   x1          - scalar, current system state (return air humidity)
+%   x1_prev     - scalar, previous system state
+%   g1          - scalar, control gain
+%   u1          - scalar, control input
+%   d_hat_prev  - scalar, previous disturbance estimate
+%   v_prev      - scalar, previous auxiliary variable
+%   beta0_hat   - scalar, estimated bound of disturbance derivative
+%   Ts          - scalar, sampling period
+%   params      - struct with fields: beta_1, beta4, b_val, gamma1
+% Outputs:
+%   d_hat       - scalar, updated disturbance estimate
+%   v           - scalar, updated auxiliary variable
+%   beta0_hat   - scalar, updated adaptive parameter
+
+beta_1 = params.beta_1;
+beta4  = params.beta4;
+b_val  = params.b_val;
+gamma1 = params.gamma1;
+
+% Auxiliary variable update: v_dot = g1*u1 + d_hat_prev
+v_dot = g1 * u1 + d_hat_prev;
+v = v_prev + Ts * v_dot;
+
+% Estimate theta_dot from measured state and auxiliary variable
+% theta = x1 - v,  theta_dot ≈ dx1 - v_dot
+dx1_est = (x1 - x1_prev) / Ts;
+theta_dot = dx1_est - v_dot;
+
+% Sliding variable (eq.15)
+s_obs = beta_1 * theta_dot;
+
+% Disturbance estimate update (eq.16)
+% sig^p(s) = |s|^p * sign(s)
+d_hat_dot = beta0_hat * sign(s_obs) ...
+          + sign(s_obs) * (abs(s_obs))^(1-b_val) / (2^(1 - b_val/2)) ...
+          + sign(s_obs) * (abs(s_obs))^(1+b_val) / (2^(1 + b_val/2)) ...
+          + beta0_hat * s_obs / beta4;
+d_hat = d_hat_prev + Ts * d_hat_dot;
+
+% Adaptive update of beta0_hat (eq.17)
+beta0_dot = -beta_1 * beta0_hat ...
+            - gamma1 * (abs(beta0_hat))^(1 + b_val) * sign(beta0_hat) ...
+            + s_obs^2 / beta4;
+beta0_hat = max(beta0_hat + Ts * beta0_dot, 0.001);
+end
+
+%% ===== Module 3: Predefined-Time Integral Sliding Mode Controller (PTISMC) =====
+% Computes control inputs u1 (supply air volume) and u2 (chilled water flow)
+% that guarantee tracking error convergence within a user-prescribed time.
+
+function [u1, u2, sI1, sI2, s1, s2] = ptismc_control(e1, e2, dyr1, dyr2, ...
+    d_hat, f_hat, g1, g2, sI1, sI2, Ts, params)
+% Inputs:
+%   e1, e2    - scalars, tracking errors (humidity, temperature)
+%   dyr1,dyr2 - scalars, derivatives of reference signals
+%   d_hat     - scalar, disturbance estimate from ASMDO
+%   f_hat     - scalar, coupling function estimate from FNN
+%   g1, g2    - scalars, control gains
+%   sI1, sI2  - scalars, integral sliding variables (previous step)
+%   Ts        - scalar, sampling period
+%   params    - struct with fields:
+%               beta_h2, beta_h3 (humidity gains)
+%               beta_t2, beta_t3 (temperature gains)
+%               b_val, sI1_max
+% Outputs:
+%   u1, u2    - scalars, control inputs
+%   sI1, sI2  - updated integral sliding variables
+%   s1, s2    - sliding surfaces
+
+b_val    = params.b_val;
+beta_h2  = params.beta_h2;
+beta_h3  = params.beta_h3;
+beta_t2  = params.beta_t2;
+beta_t3  = params.beta_t3;
+sI1_max  = params.sI1_max;
+
+% sig^p(x) = |x|^p * sign(x)  (non-italic sig function)
+sig = @(x, p) abs(x)^p * sign(x);
+
+% ---- Integral sliding surface update (eq.26-27) ----
+sig_e1_lo = sig(e1, 1 - b_val);
+sig_e1_hi = sig(e1, 1 + b_val);
+sig_e2_lo = sig(e2, 1 - b_val);
+sig_e2_hi = sig(e2, 1 + b_val);
+
+dsI1 = beta_h2 * sig_e1_lo + beta_h3 * sig_e1_hi;
+sI1  = max(-sI1_max, min(sI1_max, sI1 + Ts * dsI1));  % anti-windup
+dsI2 = beta_t2 * sig_e2_lo + beta_t3 * sig_e2_hi;
+sI2  = sI2 + Ts * dsI2;
+
+% Sliding surfaces
+s1 = e1 + sI1;
+s2 = e2 + sI2;
+
+% ---- Control law (eq.28) ----
+sig_s1_lo = sig(s1, 1 - b_val);
+sig_s1_hi = sig(s1, 1 + b_val);
+sig_s2_lo = sig(s2, 1 - b_val);
+sig_s2_hi = sig(s2, 1 + b_val);
+
+% Humidity channel: /g1 structure (g1 is negative in HVAC)
+u1 = (dyr1 - beta_h2*sig_e1_lo - beta_h3*sig_e1_hi ...
+     - d_hat - beta_h2*sig_s1_lo - beta_h3*sig_s1_hi) / (g1 + 1e-12);
+
+% Temperature channel: /g2 structure (g2 is negative constant)
+u2 = (dyr2 - beta_t2*sig_e2_lo - beta_t3*sig_e2_hi ...
+     - f_hat - beta_t2*sig_s2_lo - beta_t3*sig_s2_hi) / g2;
+
+end
+
+%% ===== Parameter Initialization Example =====
+% This function provides the default parameters used in the paper.
+
+function p = init_ptismc_params()
+
+% FNN initialization
+p.fnn_init.K = p.fnn.K;
+p.fnn_init.c = zeros(3, p.fnn.K);
+p.fnn_init.c(1,:) = linspace(12, 22, p.fnn.K) + randn(1,p.fnn.K)*0.3;
+p.fnn_init.c(2,:) = linspace(17, 24, p.fnn.K) + randn(1,p.fnn.K)*0.2;
+p.fnn_init.c(3,:) = linspace(0, 50, p.fnn.K)  + randn(1,p.fnn.K)*1.0;
+p.fnn_init.sigma = ones(1, p.fnn.K) * 3.0;
+p.fnn_init.w     = randn(1, p.fnn.K) * 0.02;
+end
